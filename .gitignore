@@ -1,0 +1,5 @@
+/target
+
+# environment
+.env
+contracts.json
