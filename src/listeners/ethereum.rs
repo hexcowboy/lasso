@@ -2,20 +2,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bigdecimal::{BigDecimal, FromPrimitive};
-use ethers::providers::{Middleware, Provider, Ws};
+use ethers::providers::{Middleware, Provider, StreamExt, Ws};
+use tokio::select;
+use tokio::sync::watch;
 
 use crate::adapters::Adapter;
 use crate::listeners::listener::{NoAdapter, SomeAdapter};
 
-pub struct EthereumListener<L> {
-    adapter: L,
+pub struct EthereumListener<A> {
+    adapter: A,
     contract_addresses: Vec<String>,
     starting_block: Option<usize>,
     rpc_url: String,
     reorg_threshold: BigDecimal,
     chain_id: BigDecimal,
-
-    _marker: std::marker::PhantomData<L>,
+    time_between_indexes: Option<Duration>,
+    killswitch: watch::Receiver<()>,
 }
 
 impl EthereumListener<NoAdapter> {
@@ -27,7 +29,8 @@ impl EthereumListener<NoAdapter> {
             rpc_url: String::new(),
             reorg_threshold: BigDecimal::from(7),
             chain_id: BigDecimal::from(1),
-            _marker: std::marker::PhantomData,
+            time_between_indexes: None,
+            killswitch: watch::channel(()).1,
         }
     }
 }
@@ -41,7 +44,8 @@ impl<T> EthereumListener<T> {
             rpc_url: self.rpc_url,
             reorg_threshold: self.reorg_threshold,
             chain_id: self.chain_id,
-            _marker: std::marker::PhantomData,
+            time_between_indexes: self.time_between_indexes,
+            killswitch: self.killswitch,
         }
     }
 
@@ -62,27 +66,75 @@ impl<T> EthereumListener<T> {
         });
         self
     }
+
+    pub fn with_time_between_indexes(mut self, time: Duration) -> Self {
+        self.time_between_indexes = Some(time);
+        self
+    }
+
+    pub fn with_killswitch(mut self, killswitch: watch::Receiver<()>) -> Self {
+        self.killswitch = killswitch;
+        self
+    }
 }
 
 impl<A: Adapter> EthereumListener<SomeAdapter<A>> {
     /// Starts listening to the provider
-    pub async fn start(self) {
+    pub async fn start(mut self) {
         let provider = Provider::<Ws>::connect(self.rpc_url.clone())
             .await
             .expect("Could not connect to RPC")
             .interval(Duration::from_secs(2));
-        let client = Arc::new(provider);
-        // let contract = Racer::new(
-        //     self.contract_address
-        //         .parse::<H160>()
-        //         .expect("Invalid contract address"),
-        //     client.clone(),
-        // );
+        let client = provider;
         let chain_id = client.get_chainid().await.unwrap();
 
-        tracing::info!("Connected to chain {}", chain_id);
+        tracing::info!("Connected to EVM chain {}", chain_id);
 
-        // self.chain_id = bytes_to_bigdecimal(chain_id);
-        // self.listen_blocks(client, &contract).await;
+        match self.time_between_indexes {
+            Some(time) => {
+                tracing::info!("Indexing every {:?} (paced mode)", time);
+                self.poll_blocks(client, time).await;
+            }
+            None => {
+                tracing::info!("Indexing every block (realtime mode)");
+                self.subscribe_blocks(client).await;
+            }
+        }
+    }
+
+    pub async fn poll_blocks(&mut self, client: Provider<Ws>, interval: Duration) {
+        let mut interval = tokio::time::interval(interval);
+
+        loop {
+            select! {
+                _ = interval.tick() => {
+                    let block = client.get_block_number().await.unwrap();
+                    tracing::info!("New block {}", block);
+                }
+                _ = self.killswitch.changed() => {
+                    tracing::warn!("Killswitch triggered, shutting down");
+                    break;
+                }
+            }
+        }
+    }
+
+    pub async fn subscribe_blocks(&mut self, client: Provider<Ws>) {
+        let mut stream = client
+            .subscribe_blocks()
+            .await
+            .expect("Could not subscribe to new blocks");
+
+        loop {
+            select! {
+                block = stream.next() => {
+                    tracing::info!("Found block {:?}", block);
+                }
+                _ = self.killswitch.changed() => {
+                    tracing::warn!("Killswitch triggered, shutting down");
+                    break;
+                }
+            }
+        }
     }
 }
