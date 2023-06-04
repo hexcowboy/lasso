@@ -2,6 +2,9 @@
   Lasso
 </h1>
 
+> **Warning**
+> Not in a usable state, under active development. Do not expect this code to work yet.
+
 <p align="center">
   A blockchain indexer that you don't pay for.
 </p>
